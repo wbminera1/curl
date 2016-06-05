@@ -641,7 +641,7 @@ gtls_connect_step1(struct connectdata *conn,
 #endif
 
 #ifdef HAS_ALPN
-  if(data->set.ssl_enable_alpn) {
+  if(conn->bits.tls_enable_alpn) {
     int cur = 0;
     gnutls_datum_t protocols[2];
 
@@ -750,6 +750,7 @@ gtls_connect_step1(struct connectdata *conn,
   /* This might be a reconnect, so we check for a session ID in the cache
      to speed up things */
 
+  Curl_ssl_sessionid_lock(conn);
   if(!Curl_ssl_getsessionid(conn, &ssl_sessionid, &ssl_idsize)) {
     /* we got a session id, use it! */
     gnutls_session_set_data(session, ssl_sessionid, ssl_idsize);
@@ -757,6 +758,7 @@ gtls_connect_step1(struct connectdata *conn,
     /* Informational message */
     infof (data, "SSL re-using session ID\n");
   }
+  Curl_ssl_sessionid_unlock(conn);
 
   return CURLE_OK;
 }
@@ -1240,7 +1242,7 @@ gtls_connect_step3(struct connectdata *conn,
   infof(data, "\t compression: %s\n", ptr);
 
 #ifdef HAS_ALPN
-  if(data->set.ssl_enable_alpn) {
+  if(conn->bits.tls_enable_alpn) {
     rc = gnutls_alpn_get_selected_protocol(session, &proto);
     if(rc == 0) {
       infof(data, "ALPN, server accepted to use %.*s\n", proto.size,
@@ -1284,6 +1286,7 @@ gtls_connect_step3(struct connectdata *conn,
       /* extract session ID to the allocated buffer */
       gnutls_session_get_data(session, connect_sessionid, &connect_idsize);
 
+      Curl_ssl_sessionid_lock(conn);
       incache = !(Curl_ssl_getsessionid(conn, &ssl_sessionid, NULL));
       if(incache) {
         /* there was one before in the cache, so instead of risking that the
@@ -1293,6 +1296,7 @@ gtls_connect_step3(struct connectdata *conn,
 
       /* store this session id */
       result = Curl_ssl_addsessionid(conn, connect_sessionid, connect_idsize);
+      Curl_ssl_sessionid_unlock(conn);
       if(result) {
         free(connect_sessionid);
         result = CURLE_OUT_OF_MEMORY;
@@ -1381,7 +1385,7 @@ static ssize_t gtls_send(struct connectdata *conn,
 {
   ssize_t rc = gnutls_record_send(conn->ssl[sockindex].session, mem, len);
 
-  if(rc < 0 ) {
+  if(rc < 0) {
     *curlcode = (rc == GNUTLS_E_AGAIN)
       ? CURLE_AGAIN
       : CURLE_SEND_ERROR;

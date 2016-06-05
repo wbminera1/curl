@@ -781,7 +781,7 @@ CF_INLINE void GetDarwinVersionNumber(int *major, int *minor)
   int mib[2];
   char *os_version;
   size_t os_version_len;
-  char *os_version_major, *os_version_minor/*, *os_version_point*/;
+  char *os_version_major, *os_version_minor;
   char *tok_buf;
 
   /* Get the Darwin kernel version from the kernel using sysctl(): */
@@ -800,7 +800,6 @@ CF_INLINE void GetDarwinVersionNumber(int *major, int *minor)
   /* Parse the version: */
   os_version_major = strtok_r(os_version, ".", &tok_buf);
   os_version_minor = strtok_r(NULL, ".", &tok_buf);
-  /*os_version_point = strtok_r(NULL, ".", &tok_buf);*/
   *major = atoi(os_version_major);
   *minor = atoi(os_version_minor);
   free(os_version);
@@ -1282,14 +1281,21 @@ static CURLcode darwinssl_connect_step1(struct connectdata *conn,
 #if CURL_BUILD_MAC_10_6 || CURL_BUILD_IOS
   /* Snow Leopard introduced the SSLSetSessionOption() function, but due to
      a library bug with the way the kSSLSessionOptionBreakOnServerAuth flag
-     works, it doesn't work as expected under Snow Leopard or Lion.
+     works, it doesn't work as expected under Snow Leopard, Lion or
+     Mountain Lion.
      So we need to call SSLSetEnableCertVerify() on those older cats in order
      to disable certificate validation if the user turned that off.
      (SecureTransport will always validate the certificate chain by
-     default.) */
-  /* (Note: Darwin 12.x.x is Mountain Lion.) */
+     default.)
+  Note:
+  Darwin 11.x.x is Lion (10.7)
+  Darwin 12.x.x is Mountain Lion (10.8)
+  Darwin 13.x.x is Mavericks (10.9)
+  Darwin 14.x.x is Yosemite (10.10)
+  Darwin 15.x.x is El Capitan (10.11)
+  */
 #if CURL_BUILD_MAC
-  if(SSLSetSessionOption != NULL && darwinver_maj >= 12) {
+  if(SSLSetSessionOption != NULL && darwinver_maj >= 13) {
 #else
   if(SSLSetSessionOption != NULL) {
 #endif /* CURL_BUILD_MAC */
@@ -1468,10 +1474,12 @@ static CURLcode darwinssl_connect_step1(struct connectdata *conn,
 #endif /* CURL_BUILD_MAC_10_9 || CURL_BUILD_IOS_7 */
 
   /* Check if there's a cached ID we can/should use here! */
+  Curl_ssl_sessionid_lock(conn);
   if(!Curl_ssl_getsessionid(conn, (void **)&ssl_sessionid,
                             &ssl_sessionid_len)) {
     /* we got a session id, use it! */
     err = SSLSetPeerID(connssl->ssl_ctx, ssl_sessionid, ssl_sessionid_len);
+    Curl_ssl_sessionid_unlock(conn);
     if(err != noErr) {
       failf(data, "SSL: SSLSetPeerID() failed: OSStatus %d", err);
       return CURLE_SSL_CONNECT_ERROR;
@@ -1491,11 +1499,13 @@ static CURLcode darwinssl_connect_step1(struct connectdata *conn,
 
     err = SSLSetPeerID(connssl->ssl_ctx, ssl_sessionid, ssl_sessionid_len);
     if(err != noErr) {
+      Curl_ssl_sessionid_unlock(conn);
       failf(data, "SSL: SSLSetPeerID() failed: OSStatus %d", err);
       return CURLE_SSL_CONNECT_ERROR;
     }
 
     result = Curl_ssl_addsessionid(conn, ssl_sessionid, ssl_sessionid_len);
+    Curl_ssl_sessionid_unlock(conn);
     if(result) {
       failf(data, "failed to store ssl session");
       return result;

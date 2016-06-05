@@ -5,7 +5,7 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) 1998 - 2015, Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) 1998 - 2016, Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -330,6 +330,25 @@ Curl_ssl_connect_nonblocking(struct connectdata *conn, int sockindex,
 }
 
 /*
+ * Lock shared SSL session data
+ */
+void Curl_ssl_sessionid_lock(struct connectdata *conn)
+{
+  if(SSLSESSION_SHARED(conn->data))
+    Curl_share_lock(conn->data,
+                    CURL_LOCK_DATA_SSL_SESSION, CURL_LOCK_ACCESS_SINGLE);
+}
+
+/*
+ * Unlock shared SSL session data
+ */
+void Curl_ssl_sessionid_unlock(struct connectdata *conn)
+{
+  if(SSLSESSION_SHARED(conn->data))
+    Curl_share_unlock(conn->data, CURL_LOCK_DATA_SSL_SESSION);
+}
+
+/*
  * Check if there's a session ID for the given connection in the cache, and if
  * there's one suitable, it is provided. Returns TRUE when no entry matched.
  */
@@ -350,10 +369,8 @@ bool Curl_ssl_getsessionid(struct connectdata *conn,
     return TRUE;
 
   /* Lock if shared */
-  if(SSLSESSION_SHARED(data)) {
-    Curl_share_lock(data, CURL_LOCK_DATA_SSL_SESSION, CURL_LOCK_ACCESS_SINGLE);
+  if(SSLSESSION_SHARED(data))
     general_age = &data->share->sessionage;
-  }
   else
     general_age = &data->state.sessionage;
 
@@ -363,6 +380,12 @@ bool Curl_ssl_getsessionid(struct connectdata *conn,
       /* not session ID means blank entry */
       continue;
     if(Curl_raw_equal(conn->host.name, check->name) &&
+       ((!conn->bits.conn_to_host && !check->conn_to_host) ||
+         (conn->bits.conn_to_host && check->conn_to_host &&
+           Curl_raw_equal(conn->conn_to_host.name, check->conn_to_host))) &&
+       ((!conn->bits.conn_to_port && check->conn_to_port == -1) ||
+         (conn->bits.conn_to_port && check->conn_to_port != -1 &&
+           conn->conn_to_port == check->conn_to_port)) &&
        (conn->remote_port == check->remote_port) &&
        Curl_ssl_config_matches(&conn->ssl_config, &check->ssl_config)) {
       /* yes, we have a session ID! */
@@ -375,10 +398,6 @@ bool Curl_ssl_getsessionid(struct connectdata *conn,
       break;
     }
   }
-
-  /* Unlock */
-  if(SSLSESSION_SHARED(data))
-    Curl_share_unlock(data, CURL_LOCK_DATA_SSL_SESSION);
 
   return no_match;
 }
@@ -400,6 +419,7 @@ void Curl_ssl_kill_session(struct curl_ssl_session *session)
     Curl_free_ssl_config(&session->ssl_config);
 
     Curl_safefree(session->name);
+    Curl_safefree(session->conn_to_host);
   }
 }
 
@@ -411,9 +431,6 @@ void Curl_ssl_delsessionid(struct connectdata *conn, void *ssl_sessionid)
   size_t i;
   struct SessionHandle *data=conn->data;
 
-  if(SSLSESSION_SHARED(data))
-    Curl_share_lock(data, CURL_LOCK_DATA_SSL_SESSION, CURL_LOCK_ACCESS_SINGLE);
-
   for(i = 0; i < data->set.ssl.max_ssl_sessions; i++) {
     struct curl_ssl_session *check = &data->state.session[i];
 
@@ -422,9 +439,6 @@ void Curl_ssl_delsessionid(struct connectdata *conn, void *ssl_sessionid)
       break;
     }
   }
-
-  if(SSLSESSION_SHARED(data))
-    Curl_share_unlock(data, CURL_LOCK_DATA_SSL_SESSION);
 }
 
 /*
@@ -442,6 +456,8 @@ CURLcode Curl_ssl_addsessionid(struct connectdata *conn,
   struct curl_ssl_session *store = &data->state.session[0];
   long oldest_age=data->state.session[0].age; /* zero if unused */
   char *clone_host;
+  char *clone_conn_to_host;
+  int conn_to_port;
   long *general_age;
 
   /* Even though session ID re-use might be disabled, that only disables USING
@@ -452,12 +468,26 @@ CURLcode Curl_ssl_addsessionid(struct connectdata *conn,
   if(!clone_host)
     return CURLE_OUT_OF_MEMORY; /* bail out */
 
+  if(conn->bits.conn_to_host) {
+    clone_conn_to_host = strdup(conn->conn_to_host.name);
+    if(!clone_conn_to_host) {
+      free(clone_host);
+      return CURLE_OUT_OF_MEMORY; /* bail out */
+    }
+  }
+  else
+    clone_conn_to_host = NULL;
+
+  if(conn->bits.conn_to_port)
+    conn_to_port = conn->conn_to_port;
+  else
+    conn_to_port = -1;
+
   /* Now we should add the session ID and the host name to the cache, (remove
      the oldest if necessary) */
 
   /* If using shared SSL session, lock! */
   if(SSLSESSION_SHARED(data)) {
-    Curl_share_lock(data, CURL_LOCK_DATA_SSL_SESSION, CURL_LOCK_ACCESS_SINGLE);
     general_age = &data->share->sessionage;
   }
   else {
@@ -484,17 +514,16 @@ CURLcode Curl_ssl_addsessionid(struct connectdata *conn,
   store->age = *general_age;    /* set current age */
     /* free it if there's one already present */
   free(store->name);
+  free(store->conn_to_host);
   store->name = clone_host;               /* clone host name */
+  store->conn_to_host = clone_conn_to_host; /* clone connect to host name */
+  store->conn_to_port = conn_to_port; /* connect to port number */
   store->remote_port = conn->remote_port; /* port number */
-
-
-  /* Unlock */
-  if(SSLSESSION_SHARED(data))
-    Curl_share_unlock(data, CURL_LOCK_DATA_SSL_SESSION);
 
   if(!Curl_clone_ssl_config(&conn->ssl_config, &store->ssl_config)) {
     store->sessionid = NULL; /* let caller free sessionid */
     free(clone_host);
+    free(clone_conn_to_host);
     return CURLE_OUT_OF_MEMORY;
   }
 
@@ -788,9 +817,9 @@ CURLcode Curl_pin_peer_pubkey(struct SessionHandle *data,
   if(!pubkey || !pubkeylen)
     return result;
 
-#ifdef curlssl_sha256sum
   /* only do this if pinnedpubkey starts with "sha256//", length 8 */
   if(strncmp(pinnedpubkey, "sha256//", 8) == 0) {
+#ifdef curlssl_sha256sum
     /* compute sha256sum of public key */
     sha256sumdigest = malloc(SHA256_DIGEST_LENGTH);
     if(!sha256sumdigest)
@@ -843,11 +872,12 @@ CURLcode Curl_pin_peer_pubkey(struct SessionHandle *data,
     } while(end_pos && begin_pos);
     Curl_safefree(encoded);
     Curl_safefree(pinkeycopy);
+#else
+    /* without sha256 support, this cannot match */
+    (void)data;
+#endif
     return result;
   }
-#else
-  (void)data;
-#endif
 
   fp = fopen(pinnedpubkey, "rb");
   if(!fp)

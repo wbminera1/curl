@@ -6,7 +6,7 @@
  *                             \___|\___/|_| \_\_____|
  *
  * Copyright (C) 2010, DirecTV, Contact: Eric Hu, <ehu@directv.com>.
- * Copyright (C) 2010 - 2015, Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) 2010 - 2016, Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -259,14 +259,18 @@ static CURLcode connect_prep(struct connectdata *conn, int sockindex)
    */
 
   /* In axTLS, handshaking happens inside ssl_client_new. */
+  Curl_ssl_sessionid_lock(conn);
   if(!Curl_ssl_getsessionid(conn, (void **) &ssl_sessionid, &ssl_idsize)) {
     /* we got a session id, use it! */
     infof (data, "SSL re-using session ID\n");
     ssl = ssl_client_new(ssl_ctx, conn->sock[sockindex],
                          ssl_sessionid, (uint8_t)ssl_idsize);
+    Curl_ssl_sessionid_unlock();
   }
-  else
+  else {
+    Curl_ssl_sessionid_unlock();
     ssl = ssl_client_new(ssl_ctx, conn->sock[sockindex], NULL, 0);
+  }
 
   conn->ssl[sockindex].ssl = ssl;
   return CURLE_OK;
@@ -381,9 +385,11 @@ static CURLcode connect_finish(struct connectdata *conn, int sockindex)
   /* Put our freshly minted SSL session in cache */
   ssl_idsize = ssl_get_session_id_size(ssl);
   ssl_sessionid = ssl_get_session_id(ssl);
+  Curl_ssl_sessionid_lock(conn);
   if(Curl_ssl_addsessionid(conn, (void *) ssl_sessionid, ssl_idsize)
      != CURLE_OK)
     infof (data, "failed to add session to cache\n");
+  Curl_ssl_sessionid_unlock(conn);
 
   return CURLE_OK;
 }
@@ -518,7 +524,7 @@ static ssize_t axtls_send(struct connectdata *conn,
 
   infof(conn->data, "  axtls_send\n");
 
-  if(rc < 0 ) {
+  if(rc < 0) {
     *err = map_error_to_curl(rc);
     rc = -1; /* generic error code for send failure */
   }

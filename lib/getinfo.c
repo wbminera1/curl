@@ -198,6 +198,22 @@ static CURLcode getinfo_long(struct SessionHandle *data, CURLINFO info,
   case CURLINFO_RTSP_CSEQ_RECV:
     *param_longp = data->state.rtsp_CSeq_recv;
     break;
+  case CURLINFO_HTTP_VERSION:
+    switch (data->info.httpversion) {
+    case 10:
+      *param_longp = CURL_HTTP_VERSION_1_0;
+      break;
+    case 11:
+      *param_longp = CURL_HTTP_VERSION_1_1;
+      break;
+    case 20:
+      *param_longp = CURL_HTTP_VERSION_2_0;
+      break;
+    default:
+      *param_longp = CURL_HTTP_VERSION_NONE;
+      break;
+    }
+    break;
 
   default:
     return CURLE_UNKNOWN_OPTION;
@@ -296,35 +312,31 @@ static CURLcode getinfo_slist(struct SessionHandle *data, CURLINFO info,
         unsigned int i;
         for(i = 0; i < (sizeof(conn->ssl) / sizeof(conn->ssl[0])); ++i) {
           if(conn->ssl[i].use) {
-#ifdef USE_AXTLS
+#if defined(USE_AXTLS)
             tsi->internals = (void *)conn->ssl[i].ssl;
-#endif
-#ifdef USE_CYASSL
+#elif defined(USE_CYASSL)
             tsi->internals = (void *)conn->ssl[i].handle;
-#endif
-#ifdef USE_DARWINSSL
+#elif defined(USE_DARWINSSL)
             tsi->internals = (void *)conn->ssl[i].ssl_ctx;
-#endif
-#ifdef USE_GNUTLS
+#elif defined(USE_GNUTLS)
             tsi->internals = (void *)conn->ssl[i].session;
-#endif
-#ifdef USE_GSKIT
+#elif defined(USE_GSKIT)
             tsi->internals = (void *)conn->ssl[i].handle;
-#endif
-#ifdef USE_NSS
+#elif defined(USE_MBEDTLS)
+            tsi->internals = (void *)&conn->ssl[i].ssl;
+#elif defined(USE_NSS)
             tsi->internals = (void *)conn->ssl[i].handle;
-#endif
-#ifdef USE_OPENSSL
+#elif defined(USE_OPENSSL)
             /* Legacy: CURLINFO_TLS_SESSION must return an SSL_CTX pointer. */
             tsi->internals = ((info == CURLINFO_TLS_SESSION) ?
                               (void *)conn->ssl[i].ctx :
                               (void *)conn->ssl[i].handle);
-#endif
-#ifdef USE_POLARSSL
-            tsi->internals = (void *)&conn->ssl[i].ssn;
-#endif
-#ifdef USE_SCHANNEL
+#elif defined(USE_POLARSSL)
+            tsi->internals = (void *)&conn->ssl[i].ssl;
+#elif defined(USE_SCHANNEL)
             tsi->internals = (void *)&conn->ssl[i].ctxt->ctxt_handle;
+#elif defined(USE_SSL)
+#error "SSL backend specific information missing for CURLINFO_TLS_SSL_PTR"
 #endif
             break;
           }

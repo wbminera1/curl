@@ -5,9 +5,9 @@
  *                            | (__| |_| |  _ <| |___
  *                             \___|\___/|_| \_\_____|
  *
- * Copyright (C) 2012 - 2015, Marc Hoersken, <info@marc-hoersken.de>
+ * Copyright (C) 2012 - 2016, Marc Hoersken, <info@marc-hoersken.de>
  * Copyright (C) 2012, Mark Salisbury, <mark.salisbury@hp.com>
- * Copyright (C) 2012 - 2015, Daniel Stenberg, <daniel@haxx.se>, et al.
+ * Copyright (C) 2012 - 2016, Daniel Stenberg, <daniel@haxx.se>, et al.
  *
  * This software is licensed as described in the file COPYING, which
  * you should have received as part of this distribution. The terms
@@ -56,10 +56,19 @@
 #include "inet_pton.h" /* for IP addr SNI check */
 #include "curl_multibyte.h"
 #include "warnless.h"
+#include "x509asn1.h"
 #include "curl_printf.h"
+#include "system_win32.h"
+
+ /* The last #include file should be: */
 #include "curl_memory.h"
-/* The last #include file should be: */
 #include "memdebug.h"
+
+/* ALPN requires version 8.1 of the  Windows SDK, which was
+   shipped with Visual Studio 2013, aka _MSC_VER 1800*/
+#if defined(_MSC_VER) && (_MSC_VER >= 1800) && !defined(_USING_V110_SDK71_)
+#  define HAS_ALPN 1
+#endif
 
 /* Uncomment to force verbose output
  * #define infof(x, y, ...) printf(y, __VA_ARGS__)
@@ -97,6 +106,11 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
   struct ssl_connect_data *connssl = &conn->ssl[sockindex];
   SecBuffer outbuf;
   SecBufferDesc outbuf_desc;
+  SecBuffer inbuf;
+  SecBufferDesc inbuf_desc;
+#ifdef HAS_ALPN
+  unsigned char alpn_buffer[128];
+#endif
   SCHANNEL_CRED schannel_cred;
   SECURITY_STATUS sspi_status = SEC_E_OK;
   struct curl_schannel_cred *old_cred = NULL;
@@ -111,11 +125,21 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
         conn->host.name, conn->remote_port);
 
   /* check for an existing re-usable credential handle */
+  Curl_ssl_sessionid_lock(conn);
   if(!Curl_ssl_getsessionid(conn, (void **)&old_cred, NULL)) {
     connssl->cred = old_cred;
     infof(data, "schannel: re-using existing credential handle\n");
+
+    /* increment the reference counter of the credential/session handle */
+    connssl->cred->refcount++;
+    infof(data, "schannel: incremented credential handle refcount = %d\n",
+          connssl->cred->refcount);
+
+    Curl_ssl_sessionid_unlock(conn);
   }
   else {
+    Curl_ssl_sessionid_unlock(conn);
+
     /* setup Schannel API options */
     memset(&schannel_cred, 0, sizeof(schannel_cred));
     schannel_cred.dwVersion = SCHANNEL_CRED_VERSION;
@@ -188,6 +212,7 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
       return CURLE_OUT_OF_MEMORY;
     }
     memset(connssl->cred, 0, sizeof(struct curl_schannel_cred));
+    connssl->cred->refcount = 1;
 
     /* https://msdn.microsoft.com/en-us/library/windows/desktop/aa374716.aspx
        */
@@ -219,6 +244,60 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
     infof(data, "schannel: using IP address, SNI is not supported by OS.\n");
   }
 
+#ifdef HAS_ALPN
+  if(conn->bits.tls_enable_alpn) {
+    int cur = 0;
+    int list_start_index = 0;
+    unsigned int* extension_len = NULL;
+    unsigned short* list_len = NULL;
+
+    /* The first four bytes will be an unsigned int indicating number
+       of bytes of data in the rest of the the buffer. */
+    extension_len = (unsigned int*)(&alpn_buffer[cur]);
+    cur += sizeof(unsigned int);
+
+    /* The next four bytes are an indicator that this buffer will contain
+       ALPN data, as opposed to NPN, for example. */
+    *(unsigned int*)&alpn_buffer[cur] =
+      SecApplicationProtocolNegotiationExt_ALPN;
+    cur += sizeof(unsigned int);
+
+    /* The next two bytes will be an unsigned short indicating the number
+       of bytes used to list the preferred protocols. */
+    list_len = (unsigned short*)(&alpn_buffer[cur]);
+    cur += sizeof(unsigned short);
+
+    list_start_index = cur;
+
+#ifdef USE_NGHTTP2
+    if(data->set.httpversion >= CURL_HTTP_VERSION_2) {
+      memcpy(&alpn_buffer[cur], NGHTTP2_PROTO_ALPN, NGHTTP2_PROTO_ALPN_LEN);
+      cur += NGHTTP2_PROTO_ALPN_LEN;
+      infof(data, "schannel: ALPN, offering %s\n", NGHTTP2_PROTO_VERSION_ID);
+    }
+#endif
+
+    alpn_buffer[cur++] = ALPN_HTTP_1_1_LENGTH;
+    memcpy(&alpn_buffer[cur], ALPN_HTTP_1_1, ALPN_HTTP_1_1_LENGTH);
+    cur += ALPN_HTTP_1_1_LENGTH;
+    infof(data, "schannel: ALPN, offering %s\n", ALPN_HTTP_1_1);
+
+    *list_len = curlx_uitous(cur - list_start_index);
+    *extension_len = *list_len + sizeof(unsigned int) + sizeof(unsigned short);
+
+    InitSecBuffer(&inbuf, SECBUFFER_APPLICATION_PROTOCOLS, alpn_buffer, cur);
+    InitSecBufferDesc(&inbuf_desc, &inbuf, 1);
+  }
+  else
+  {
+    InitSecBuffer(&inbuf, SECBUFFER_EMPTY, NULL, 0);
+    InitSecBufferDesc(&inbuf_desc, &inbuf, 1);
+  }
+#else /* HAS_ALPN */
+  InitSecBuffer(&inbuf, SECBUFFER_EMPTY, NULL, 0);
+  InitSecBufferDesc(&inbuf_desc, &inbuf, 1);
+#endif
+
   /* setup output buffer */
   InitSecBuffer(&outbuf, SECBUFFER_EMPTY, NULL, 0);
   InitSecBufferDesc(&outbuf_desc, &outbuf, 1);
@@ -245,7 +324,7 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
 
   sspi_status = s_pSecFn->InitializeSecurityContext(
     &connssl->cred->cred_handle, NULL, host_name,
-    connssl->req_flags, 0, 0, NULL, 0, &connssl->ctxt->ctxt_handle,
+    connssl->req_flags, 0, 0, &inbuf_desc, 0, &connssl->ctxt->ctxt_handle,
     &outbuf_desc, &connssl->ret_flags, &connssl->ctxt->time_stamp);
 
   Curl_unicodefree(host_name);
@@ -535,6 +614,11 @@ schannel_connect_step3(struct connectdata *conn, int sockindex)
   struct SessionHandle *data = conn->data;
   struct ssl_connect_data *connssl = &conn->ssl[sockindex];
   struct curl_schannel_cred *old_cred = NULL;
+  SECURITY_STATUS sspi_status = SEC_E_OK;
+  CERT_CONTEXT *ccert_context = NULL;
+#ifdef HAS_ALPN
+  SecPkgContext_ApplicationProtocol alpn_result;
+#endif
   bool incache;
 
   DEBUGASSERT(ssl_connect_3 == connssl->connecting_state);
@@ -560,18 +644,48 @@ schannel_connect_step3(struct connectdata *conn, int sockindex)
     return CURLE_SSL_CONNECT_ERROR;
   }
 
-  /* increment the reference counter of the credential/session handle */
-  if(connssl->cred && connssl->ctxt) {
-    connssl->cred->refcount++;
-    infof(data, "schannel: incremented credential handle refcount = %d\n",
-          connssl->cred->refcount);
+#ifdef HAS_ALPN
+  if(conn->bits.tls_enable_alpn) {
+    sspi_status = s_pSecFn->QueryContextAttributes(&connssl->ctxt->ctxt_handle,
+      SECPKG_ATTR_APPLICATION_PROTOCOL, &alpn_result);
+
+    if(sspi_status != SEC_E_OK) {
+      failf(data, "schannel: failed to retrieve ALPN result");
+      return CURLE_SSL_CONNECT_ERROR;
+    }
+
+    if(alpn_result.ProtoNegoStatus ==
+       SecApplicationProtocolNegotiationStatus_Success) {
+
+      infof(data, "schannel: ALPN, server accepted to use %.*s\n",
+        alpn_result.ProtocolIdSize, alpn_result.ProtocolId);
+
+#ifdef USE_NGHTTP2
+      if(alpn_result.ProtocolIdSize == NGHTTP2_PROTO_VERSION_ID_LEN &&
+         !memcmp(NGHTTP2_PROTO_VERSION_ID, alpn_result.ProtocolId,
+          NGHTTP2_PROTO_VERSION_ID_LEN)) {
+        conn->negnpn = CURL_HTTP_VERSION_2;
+      }
+      else
+#endif
+      if(alpn_result.ProtocolIdSize == ALPN_HTTP_1_1_LENGTH &&
+         !memcmp(ALPN_HTTP_1_1, alpn_result.ProtocolId,
+           ALPN_HTTP_1_1_LENGTH)) {
+        conn->negnpn = CURL_HTTP_VERSION_1_1;
+      }
+    }
+    else
+      infof(data, "ALPN, server did not agree to a protocol\n");
   }
+#endif
 
   /* save the current session data for possible re-use */
+  Curl_ssl_sessionid_lock(conn);
   incache = !(Curl_ssl_getsessionid(conn, (void **)&old_cred, NULL));
   if(incache) {
     if(old_cred != connssl->cred) {
       infof(data, "schannel: old credential handle is stale, removing\n");
+      /* we're not taking old_cred ownership here, no refcount++ is needed */
       Curl_ssl_delsessionid(conn, (void *)old_cred);
       incache = FALSE;
     }
@@ -581,13 +695,40 @@ schannel_connect_step3(struct connectdata *conn, int sockindex)
     result = Curl_ssl_addsessionid(conn, (void *)connssl->cred,
                                    sizeof(struct curl_schannel_cred));
     if(result) {
+      Curl_ssl_sessionid_unlock(conn);
       failf(data, "schannel: failed to store credential handle");
       return result;
     }
     else {
-      connssl->cred->cached = TRUE;
+      /* this cred session is now also referenced by sessionid cache */
+      connssl->cred->refcount++;
       infof(data, "schannel: stored credential handle in session cache\n");
     }
+  }
+  Curl_ssl_sessionid_unlock(conn);
+
+  if(data->set.ssl.certinfo) {
+    sspi_status = s_pSecFn->QueryContextAttributes(&connssl->ctxt->ctxt_handle,
+      SECPKG_ATTR_REMOTE_CERT_CONTEXT, &ccert_context);
+
+    if((sspi_status != SEC_E_OK) || (ccert_context == NULL)) {
+      failf(data, "schannel: failed to retrieve remote cert context");
+      return CURLE_SSL_CONNECT_ERROR;
+    }
+
+    result = Curl_ssl_init_certinfo(data, 1);
+    if(!result) {
+      if(((ccert_context->dwCertEncodingType & X509_ASN_ENCODING) != 0) &&
+         (ccert_context->cbCertEncoded > 0)) {
+
+        const char *beg = (const char *) ccert_context->pbCertEncoded;
+        const char *end = beg + ccert_context->cbCertEncoded;
+        result = Curl_extract_certinfo(conn, 0, beg, end);
+      }
+    }
+    CertFreeCertificateContext(ccert_context);
+    if(result)
+      return result;
   }
 
   connssl->connecting_state = ssl_connect_done;
@@ -1122,39 +1263,8 @@ cleanup:
   */
   if(len && !connssl->decdata_offset && connssl->recv_connection_closed &&
      !connssl->recv_sspi_close_notify) {
-    bool isWin2k = FALSE;
-
-#if !defined(_WIN32_WINNT) || !defined(_WIN32_WINNT_WIN2K) || \
-    (_WIN32_WINNT < _WIN32_WINNT_WIN2K)
-    OSVERSIONINFO osver;
-
-    memset(&osver, 0, sizeof(osver));
-    osver.dwOSVersionInfoSize = sizeof(osver);
-
-    /* Find out the Windows version */
-    if(GetVersionEx(&osver)) {
-      /* Verify the version number is 5.0 */
-      if(osver.dwMajorVersion == 5 && osver.dwMinorVersion == 0)
-        isWin2k = TRUE;
-    }
-#else
-    ULONGLONG cm;
-    OSVERSIONINFOEX osver;
-
-    memset(&osver, 0, sizeof(osver));
-    osver.dwOSVersionInfoSize = sizeof(osver);
-    osver.dwMajorVersion = 5;
-
-    cm = VerSetConditionMask(0, VER_MAJORVERSION, VER_EQUAL);
-    cm = VerSetConditionMask(cm, VER_MINORVERSION, VER_EQUAL);
-    cm = VerSetConditionMask(cm, VER_SERVICEPACKMAJOR, VER_GREATER_EQUAL);
-    cm = VerSetConditionMask(cm, VER_SERVICEPACKMINOR, VER_GREATER_EQUAL);
-
-    if(VerifyVersionInfo(&osver, (VER_MAJORVERSION | VER_MINORVERSION |
-                                  VER_SERVICEPACKMAJOR | VER_SERVICEPACKMINOR),
-                         cm))
-      isWin2k = TRUE;
-#endif
+    bool isWin2k = Curl_verify_windows_version(5, 0, PLATFORM_WINNT,
+                                               VERSION_EQUAL);
 
     if(isWin2k && sspi_status == SEC_E_OK)
       connssl->recv_sspi_close_notify = true;
@@ -1222,7 +1332,7 @@ bool Curl_schannel_data_pending(const struct connectdata *conn, int sockindex)
 
   if(connssl->use) /* SSL/TLS is in use */
     return (connssl->encdata_offset > 0 ||
-            connssl->decdata_offset > 0 ) ? TRUE : FALSE;
+            connssl->decdata_offset > 0) ? TRUE : FALSE;
   else
     return FALSE;
 }
@@ -1312,19 +1422,10 @@ int Curl_schannel_shutdown(struct connectdata *conn, int sockindex)
 
   /* free SSPI Schannel API credential handle */
   if(connssl->cred) {
-    /* decrement the reference counter of the credential/session handle */
-    if(connssl->cred->refcount > 0) {
-      connssl->cred->refcount--;
-      infof(data, "schannel: decremented credential handle refcount = %d\n",
-            connssl->cred->refcount);
-    }
-
-    /* if the handle was not cached and the refcount is zero */
-    if(!connssl->cred->cached && connssl->cred->refcount == 0) {
-      infof(data, "schannel: clear credential handle\n");
-      s_pSecFn->FreeCredentialsHandle(&connssl->cred->cred_handle);
-      Curl_safefree(connssl->cred);
-    }
+    Curl_ssl_sessionid_lock(conn);
+    Curl_schannel_session_free(connssl->cred);
+    Curl_ssl_sessionid_unlock(conn);
+    connssl->cred = NULL;
   }
 
   /* free internal buffer for received encrypted data */
@@ -1346,16 +1447,13 @@ int Curl_schannel_shutdown(struct connectdata *conn, int sockindex)
 
 void Curl_schannel_session_free(void *ptr)
 {
+  /* this is expected to be called under sessionid lock */
   struct curl_schannel_cred *cred = ptr;
 
-  if(cred && cred->cached) {
-    if(cred->refcount == 0) {
-      s_pSecFn->FreeCredentialsHandle(&cred->cred_handle);
-      Curl_safefree(cred);
-    }
-    else {
-      cred->cached = FALSE;
-    }
+  cred->refcount--;
+  if(cred->refcount == 0) {
+    s_pSecFn->FreeCredentialsHandle(&cred->cred_handle);
+    Curl_safefree(cred);
   }
 }
 
